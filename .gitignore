@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+data/soul.md
+data/owner.md
+data/state.json
+data/conversation_log.json
+data/avatar.png
+DESIGN_AND_PLAN.md
+PROGRESS.md
