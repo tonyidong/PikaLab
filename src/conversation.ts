@@ -1,5 +1,6 @@
-import { Message, TextChannel, DMChannel } from 'discord.js';
+import { Message, TextChannel, DMChannel, AttachmentBuilder } from 'discord.js';
 import { chat, type ChatMessage } from './utils/llm.js';
+import { generateImage } from './utils/image.js';
 import { buildSystemPrompt } from './prompts/system.js';
 import { appendMessage, loadConversationLog } from './brain/memory.js';
 import { loadState, saveState } from './brain/state.js';
@@ -10,6 +11,7 @@ import { logger } from './utils/logger.js';
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const BATCH_DELAY_MS = 1500;
+const IMAGE_TAG_RE = /\[IMAGE:\s*(.+?)\]/i;
 
 // Dedup — Discord sometimes delivers the same event twice
 const seenIds = new Set<string>();
@@ -19,7 +21,6 @@ let busy = false;
 let queued: Message[] = [];
 
 export async function handleMessage(message: Message): Promise<void> {
-  // Hard dedup by Discord message ID
   if (seenIds.has(message.id)) return;
   seenIds.add(message.id);
   if (seenIds.size > 500) {
@@ -30,13 +31,11 @@ export async function handleMessage(message: Message): Promise<void> {
 
   queued.push(message);
 
-  // If we're already generating a response, just queue it for the next round
   if (busy) return;
 
   busy = true;
   try {
     while (queued.length > 0) {
-      // Small window to batch rapid-fire messages
       await sleep(BATCH_DELAY_MS);
       const batch = queued.splice(0);
       await respond(batch);
@@ -52,42 +51,71 @@ async function respond(messages: Message[]): Promise<void> {
   const ownerText = messages.map((m) => m.content).join('\n');
 
   try {
-    // Typing indicator
     if ('sendTyping' in channel) {
       await channel.sendTyping();
     }
 
-    // 1. Load existing context FIRST (before we mutate the log)
+    // 1. Load context before mutating anything
     const [systemPrompt, history, state] = await Promise.all([
       buildSystemPrompt(),
       loadConversationLog(),
       loadState(),
     ]);
 
-    // 2. Build the messages array for the LLM:
-    //    existing history + this new owner message
+    // 2. Build messages for the LLM: history + new owner message
     const chatMessages: ChatMessage[] = history.map((m) => ({
       role: m.role === 'owner' ? ('user' as const) : ('model' as const),
       content: m.content,
     }));
     chatMessages.push({ role: 'user', content: ownerText });
 
-    // 3. Generate response
+    // 3. Generate text response
     const response = await chat(systemPrompt, chatMessages, {
-      maxTokens: 300,
+      maxTokens: 400,
       temperature: 0.85,
     });
 
     logger.info(`[${messages.length} msg] → "${response.content.slice(0, 80)}"`);
 
-    // 4. Natural delay
-    const delay = Math.min(Math.max(response.content.length * 30, 800), 3000);
+    // 4. Check if the LLM wants to generate an image
+    const imageMatch = response.content.match(IMAGE_TAG_RE);
+    let imageBuffer: Buffer | null = null;
+    let textToSend = response.content;
+
+    if (imageMatch) {
+      const imagePrompt = imageMatch[1];
+      textToSend = response.content.replace(IMAGE_TAG_RE, '').trim();
+      logger.info(`Generating image: "${imagePrompt.slice(0, 80)}"`);
+
+      // Keep typing indicator alive while generating
+      if ('sendTyping' in channel) {
+        await channel.sendTyping();
+      }
+
+      imageBuffer = await generateImage(imagePrompt);
+    }
+
+    // 5. Natural delay
+    const delay = Math.min(Math.max((textToSend.length) * 30, 800), 3000);
     await sleep(delay);
 
-    // 5. Send to Discord
-    await channel.send(response.content);
+    // 6. Send to Discord (text + optional image)
+    if (imageBuffer) {
+      const attachment = new AttachmentBuilder(imageBuffer, { name: 'image.png' });
+      if (textToSend) {
+        await channel.send({ content: textToSend, files: [attachment] });
+      } else {
+        await channel.send({ files: [attachment] });
+      }
+    } else {
+      await channel.send(textToSend || response.content);
+    }
 
-    // 6. NOW persist both sides to the log (after successful send)
+    // 7. Persist both sides to the log
+    const botLogContent = imageMatch
+      ? `${textToSend} (sent an image: ${imageMatch[1]})`
+      : response.content;
+
     await appendMessage({
       role: 'owner',
       content: ownerText,
@@ -95,18 +123,18 @@ async function respond(messages: Message[]): Promise<void> {
     });
     await appendMessage({
       role: 'bot',
-      content: response.content,
+      content: botLogContent,
       timestamp: new Date().toISOString(),
     });
 
-    // 7. Update relational state
+    // 8. Update relational state
     state.lastOwnerMessage = new Date().toISOString();
     state.outreachAttemptsSinceResponse = 0;
     state.ownerResponseRate = updateResponseRate(state, true);
     state.messagesSinceLastReflection += 1;
     await saveState(state);
 
-    // 8. Maybe trigger async reflection
+    // 9. Maybe trigger async reflection
     if (shouldReflect(state.messagesSinceLastReflection)) {
       logger.info('Triggering reflection...');
       reflect().catch((err) =>
