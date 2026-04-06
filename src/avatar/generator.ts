@@ -19,11 +19,8 @@ Personality description:
 ${soul}`;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash-exp',
+      model: 'gemini-3.1-flash-image-preview',
       contents: prompt,
-      config: {
-        responseModalities: ['TEXT', 'IMAGE'],
-      },
     });
 
     const parts = response.candidates?.[0]?.content?.parts ?? [];
