@@ -41,7 +41,7 @@ function normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
 export async function chat(
   systemPrompt: string,
   messages: ChatMessage[],
-  options?: { maxTokens?: number; temperature?: number }
+  options?: { maxTokens?: number; temperature?: number; tools?: Record<string, unknown>[] }
 ): Promise<LLMResponse> {
   const maxAttempts = 3;
   const normalized = normalizeMessages(messages);
@@ -55,14 +55,20 @@ export async function chat(
           }))
         : [{ role: 'user' as const, parts: [{ text: 'Begin.' }] }];
 
+      const config: Record<string, unknown> = {
+        systemInstruction: systemPrompt,
+        maxOutputTokens: options?.maxTokens ?? 300,
+        temperature: options?.temperature ?? 0.85,
+      };
+
+      if (options?.tools && options.tools.length > 0) {
+        config.tools = options.tools;
+      }
+
       const response = await ai.models.generateContent({
         model: 'gemini-3.1-flash-lite-preview',
         contents,
-        config: {
-          systemInstruction: systemPrompt,
-          maxOutputTokens: options?.maxTokens ?? 300,
-          temperature: options?.temperature ?? 0.85,
-        },
+        config,
       });
 
       const text = response.text?.trim();

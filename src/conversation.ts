@@ -13,6 +13,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const BATCH_DELAY_MS = 1500;
 const IMAGE_TAG_RE = /\[IMAGE:\s*(.+?)\]/i;
 const REACT_TAG_RE = /\[REACT:\s*(.+?)\]/gi;
+const URL_RE = /https?:\/\/[^\s]+/i;
 
 // Dedup — Discord sometimes delivers the same event twice
 const seenIds = new Set<string>();
@@ -70,10 +71,16 @@ async function respond(messages: Message[]): Promise<void> {
     }));
     chatMessages.push({ role: 'user', content: ownerText });
 
-    // 3. Generate text response
+    // 3. Generate text response — enable web tools when URLs or search-worthy content is present
+    const hasUrl = URL_RE.test(ownerText);
+    const tools: Record<string, unknown>[] = [];
+    if (hasUrl) tools.push({ urlContext: {} });
+    tools.push({ googleSearch: {} });
+
     const response = await chat(systemPrompt, chatMessages, {
       maxTokens: 400,
       temperature: 0.85,
+      tools,
     });
 
     logger.info(`[${messages.length} msg] → "${response.content.slice(0, 80)}"`);
