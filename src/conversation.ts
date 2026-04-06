@@ -12,6 +12,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const BATCH_DELAY_MS = 1500;
 const IMAGE_TAG_RE = /\[IMAGE:\s*(.+?)\]/i;
+const REACT_TAG_RE = /\[REACT:\s*(.+?)\]/gi;
 
 // Dedup — Discord sometimes delivers the same event twice
 const seenIds = new Set<string>();
@@ -77,14 +78,29 @@ async function respond(messages: Message[]): Promise<void> {
 
     logger.info(`[${messages.length} msg] → "${response.content.slice(0, 80)}"`);
 
-    // 4. Check if the LLM wants to generate an image
-    const imageMatch = response.content.match(IMAGE_TAG_RE);
+    // 4a. Check for reactions — apply them to the last owner message
+    const reactMatches = [...response.content.matchAll(REACT_TAG_RE)];
+    let textToSend = response.content.replace(REACT_TAG_RE, '').trim();
+
+    if (reactMatches.length > 0) {
+      const lastOwnerMsg = messages[messages.length - 1];
+      for (const match of reactMatches) {
+        const emoji = match[1].trim();
+        try {
+          await lastOwnerMsg.react(emoji);
+        } catch (err) {
+          logger.warn(`Failed to react with ${emoji}`, err);
+        }
+      }
+    }
+
+    // 4b. Check if the LLM wants to generate an image
+    const imageMatch = textToSend.match(IMAGE_TAG_RE);
     let imageBuffer: Buffer | null = null;
-    let textToSend = response.content;
 
     if (imageMatch) {
       const imagePrompt = imageMatch[1];
-      textToSend = response.content.replace(IMAGE_TAG_RE, '').trim();
+      textToSend = textToSend.replace(IMAGE_TAG_RE, '').trim();
       logger.info(`Generating image: "${imagePrompt.slice(0, 80)}"`);
 
       // Keep typing indicator alive while generating
@@ -99,7 +115,7 @@ async function respond(messages: Message[]): Promise<void> {
     const delay = Math.min(Math.max((textToSend.length) * 30, 800), 3000);
     await sleep(delay);
 
-    // 6. Send to Discord (text + optional image)
+    // 6. Send to Discord (text + optional image, skip if reaction-only)
     if (imageBuffer) {
       const attachment = new AttachmentBuilder(imageBuffer, { name: 'image.png' });
       if (textToSend) {
@@ -107,8 +123,8 @@ async function respond(messages: Message[]): Promise<void> {
       } else {
         await channel.send({ files: [attachment] });
       }
-    } else {
-      await channel.send(textToSend || response.content);
+    } else if (textToSend) {
+      await channel.send(textToSend);
     }
 
     // 7. Persist both sides to the log

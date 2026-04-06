@@ -105,5 +105,11 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
+// --- Write PID file so restarts can kill this process reliably ---
+import fs from 'node:fs';
+const PID_FILE = './data/.bot.pid';
+fs.mkdirSync('./data', { recursive: true });
+fs.writeFileSync(PID_FILE, String(process.pid));
+
 // --- Start ---
 client.login(process.env.DISCORD_TOKEN);
