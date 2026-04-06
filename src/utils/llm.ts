@@ -3,13 +3,6 @@ import { logger } from './logger.js';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 
-const FALLBACK_MESSAGES = [
-  "hmm, lost my train of thought for a sec. what were you saying?",
-  "sorry, my brain glitched — can you say that again?",
-  "whoa, spaced out there for a moment. one more time?",
-  "haha okay something weird just happened in my head. what was that?",
-];
-
 export interface ChatMessage {
   role: 'user' | 'model';
   content: string;
@@ -20,8 +13,29 @@ export interface LLMResponse {
   failed?: boolean;
 }
 
-function pickRandom<T>(arr: T[]): T {
-  return arr[Math.floor(Math.random() * arr.length)];
+/**
+ * Gemini requires strictly alternating user/model turns.
+ * Merge any consecutive same-role messages into one.
+ */
+function normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length === 0) return [];
+
+  const merged: ChatMessage[] = [];
+  for (const msg of messages) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === msg.role) {
+      last.content += '\n' + msg.content;
+    } else {
+      merged.push({ role: msg.role, content: msg.content });
+    }
+  }
+
+  // Gemini needs the last message to be 'user' for a response
+  if (merged.length > 0 && merged[merged.length - 1].role === 'model') {
+    merged.push({ role: 'user', content: '(continue)' });
+  }
+
+  return merged;
 }
 
 export async function chat(
@@ -30,11 +44,12 @@ export async function chat(
   options?: { maxTokens?: number; temperature?: number }
 ): Promise<LLMResponse> {
   const maxAttempts = 3;
+  const normalized = normalizeMessages(messages);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const contents = messages.length > 0
-        ? messages.map((m) => ({
+      const contents = normalized.length > 0
+        ? normalized.map((m) => ({
             role: m.role,
             parts: [{ text: m.content }],
           }))
@@ -63,12 +78,14 @@ export async function chat(
   }
 
   logger.error('All LLM attempts failed, using fallback');
-  return { content: pickRandom(FALLBACK_MESSAGES), failed: true };
+  return {
+    content: "hmm, lost my train of thought for a sec. what were you saying?",
+    failed: true,
+  };
 }
 
 /**
  * Structured chat — asks the LLM to return JSON.
- * Parses the response and returns the object, or null on failure.
  */
 export async function chatJSON<T>(
   systemPrompt: string,
@@ -79,7 +96,6 @@ export async function chatJSON<T>(
   if (response.failed) return null;
 
   try {
-    // Strip markdown code fences if present
     let raw = response.content;
     raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
     return JSON.parse(raw) as T;

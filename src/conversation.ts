@@ -9,124 +9,118 @@ import { logger } from './utils/logger.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-const BATCH_WINDOW_MS = 2000;
+const BATCH_DELAY_MS = 1500;
 
-// Serial queue — only one response generation at a time
-let processing = false;
-const queue: Array<() => Promise<void>> = [];
+// Dedup — Discord sometimes delivers the same event twice
+const seenIds = new Set<string>();
 
-async function drainQueue(): Promise<void> {
-  if (processing) return;
-  processing = true;
-  while (queue.length > 0) {
-    const task = queue.shift()!;
-    await task();
-  }
-  processing = false;
-}
+// Ensures only one response is being generated at a time
+let busy = false;
+let queued: Message[] = [];
 
-// Batching — collect rapid messages before responding
-let pendingMessages: Message[] = [];
-let batchTimer: ReturnType<typeof setTimeout> | null = null;
-
-/**
- * Handle an incoming message from the owner.
- * Batches rapid messages, then processes them as one turn.
- */
 export async function handleMessage(message: Message): Promise<void> {
-  pendingMessages.push(message);
+  // Hard dedup by Discord message ID
+  if (seenIds.has(message.id)) return;
+  seenIds.add(message.id);
+  if (seenIds.size > 500) {
+    const keep = [...seenIds].slice(-250);
+    seenIds.clear();
+    keep.forEach((id) => seenIds.add(id));
+  }
 
-  if (batchTimer) clearTimeout(batchTimer);
+  queued.push(message);
 
-  batchTimer = setTimeout(() => {
-    const batch = [...pendingMessages];
-    pendingMessages = [];
-    batchTimer = null;
+  // If we're already generating a response, just queue it for the next round
+  if (busy) return;
 
-    queue.push(() => processBatch(batch));
-    drainQueue();
-  }, BATCH_WINDOW_MS);
+  busy = true;
+  try {
+    while (queued.length > 0) {
+      // Small window to batch rapid-fire messages
+      await sleep(BATCH_DELAY_MS);
+      const batch = queued.splice(0);
+      await respond(batch);
+    }
+  } finally {
+    busy = false;
+  }
 }
 
-async function processBatch(messages: Message[]): Promise<void> {
+async function respond(messages: Message[]): Promise<void> {
   if (messages.length === 0) return;
-
-  const channel = messages[0].channel;
-  const combinedContent = messages.map((m) => m.content).join('\n');
+  const channel = messages[0].channel as TextChannel | DMChannel;
+  const ownerText = messages.map((m) => m.content).join('\n');
 
   try {
-    // Show typing indicator
+    // Typing indicator
     if ('sendTyping' in channel) {
-      await (channel as TextChannel | DMChannel).sendTyping();
+      await channel.sendTyping();
     }
 
-    // Log all incoming messages
-    for (const msg of messages) {
-      await appendMessage({
-        role: 'owner',
-        content: msg.content,
-        timestamp: new Date().toISOString(),
-      });
-    }
+    // 1. Load existing context FIRST (before we mutate the log)
+    const [systemPrompt, history, state] = await Promise.all([
+      buildSystemPrompt(),
+      loadConversationLog(),
+      loadState(),
+    ]);
 
-    // Update relational state
-    const state = await loadState();
-    state.lastOwnerMessage = new Date().toISOString();
-    state.outreachAttemptsSinceResponse = 0;
-    state.ownerResponseRate = updateResponseRate(state, true);
-    state.messagesSinceLastReflection += messages.length;
-    await saveState(state);
-
-    // Build system prompt with full context
-    const systemPrompt = await buildSystemPrompt();
-
-    // Load recent conversation for multi-turn context
-    const recentMessages = await loadConversationLog();
-    const chatMessages: ChatMessage[] = recentMessages.map((m) => ({
-      role: m.role === 'owner' ? 'user' : 'model',
+    // 2. Build the messages array for the LLM:
+    //    existing history + this new owner message
+    const chatMessages: ChatMessage[] = history.map((m) => ({
+      role: m.role === 'owner' ? ('user' as const) : ('model' as const),
       content: m.content,
     }));
+    chatMessages.push({ role: 'user', content: ownerText });
 
-    // Generate one response for the whole batch
+    // 3. Generate response
     const response = await chat(systemPrompt, chatMessages, {
       maxTokens: 300,
       temperature: 0.85,
     });
 
-    // Natural typing delay (30ms per character, clamped 0.8s–3s)
-    const typingDelay = Math.min(
-      Math.max(response.content.length * 30, 800),
-      3000
-    );
-    await sleep(typingDelay);
+    logger.info(`[${messages.length} msg] → "${response.content.slice(0, 80)}"`);
 
-    // Send as a normal message — not a reply, feels more human
-    await (channel as TextChannel | DMChannel).send(response.content);
+    // 4. Natural delay
+    const delay = Math.min(Math.max(response.content.length * 30, 800), 3000);
+    await sleep(delay);
 
-    // Log bot response
+    // 5. Send to Discord
+    await channel.send(response.content);
+
+    // 6. NOW persist both sides to the log (after successful send)
+    await appendMessage({
+      role: 'owner',
+      content: ownerText,
+      timestamp: new Date().toISOString(),
+    });
     await appendMessage({
       role: 'bot',
       content: response.content,
       timestamp: new Date().toISOString(),
     });
 
-    // Maybe trigger async reflection
-    const updatedState = await loadState();
-    if (shouldReflect(updatedState.messagesSinceLastReflection)) {
+    // 7. Update relational state
+    state.lastOwnerMessage = new Date().toISOString();
+    state.outreachAttemptsSinceResponse = 0;
+    state.ownerResponseRate = updateResponseRate(state, true);
+    state.messagesSinceLastReflection += 1;
+    await saveState(state);
+
+    // 8. Maybe trigger async reflection
+    if (shouldReflect(state.messagesSinceLastReflection)) {
       logger.info('Triggering reflection...');
       reflect().catch((err) =>
         logger.error('Background reflection failed', err)
       );
     }
   } catch (err) {
-    logger.error('Failed to handle message batch', err);
-
+    logger.error('Failed to respond', err);
     try {
-      await (channel as TextChannel | DMChannel).send(
-        "sorry, something went sideways in my head. give me a sec and try again?"
+      await channel.send(
+        "sorry, something went sideways in my head for a sec"
       );
     } catch {
-      logger.error('Could not send error message to Discord');
+      // nothing we can do
     }
   }
 }
