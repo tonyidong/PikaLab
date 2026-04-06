@@ -33,10 +33,12 @@ export async function chat(
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const contents = messages.map((m) => ({
-        role: m.role,
-        parts: [{ text: m.content }],
-      }));
+      const contents = messages.length > 0
+        ? messages.map((m) => ({
+            role: m.role,
+            parts: [{ text: m.content }],
+          }))
+        : [{ role: 'user' as const, parts: [{ text: 'Begin.' }] }];
 
       const response = await ai.models.generateContent({
         model: 'gemini-3.1-flash-lite-preview',
