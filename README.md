@@ -35,6 +35,8 @@ The bot can also:
 - **React to messages** with emoji
 - **Read URLs** the owner shares (Gemini URL context)
 - **Search the web** for current information (Google Search grounding)
+- **Understand voice messages** — transcribes and responds naturally
+- **Reply with voice messages** — converts its text response to speech and sends a native Discord voice message
 
 ### The Reflection Loop
 
@@ -66,6 +68,18 @@ Frequency adapts to the relationship stage:
 | Established | 24 hours |
 
 If the owner ignores outreach: exponential backoff (2x per unanswered attempt). Hard stop after 3 consecutive ignores. Response rate is tracked with an exponential moving average. ±20% jitter on all intervals.
+
+### Voice Messages
+
+The bot natively understands and replies with Discord voice messages:
+
+```
+Owner voice msg → Download OGG → Gemini transcription → Chat LLM → Gemini TTS → OGG Opus → Discord voice message
+```
+
+- **Incoming**: Voice messages are downloaded, sent to Gemini as inline audio data for transcription, then processed through the normal conversation pipeline.
+- **Outgoing**: The text response is converted to speech via `gemini-2.5-flash-preview-tts`, then encoded to OGG Opus (via ffmpeg) and sent as a native Discord voice message using the raw REST API.
+- **Mode switching**: Voice in → voice out. Text in → text out. If the owner says "reply in text" during a voice conversation, the bot switches back to text.
 
 ---
 
@@ -122,6 +136,9 @@ They value my role as a friend over my role as a content generator.
 | LLM API down | Retry 3x with exponential backoff → graceful fallback message |
 | LLM returns bad JSON (reflection) | Skip reflection, try next cycle |
 | Image generation fails | Continue without image, retry next reflection |
+| Voice transcription fails | Logs error, tells LLM a voice message was sent but couldn't be read |
+| TTS generation fails | Falls back to sending the reply as text instead |
+| Voice message send fails | Falls back to sending the reply as text instead |
 | Owner ignores outreach | Exponential backoff → hard stop after 3 attempts |
 | File read fails | Return defaults, continue running |
 | Discord API error | Log and skip (outreach) or send error message (conversation) |
@@ -153,6 +170,8 @@ src/
 └── utils/
     ├── llm.ts               # Gemini API wrapper (retry, role normalization)
     ├── image.ts             # Image generation wrapper
+    ├── audio.ts             # Transcription + TTS (Gemini) + PCM/WAV/OGG conversion
+    ├── discord-voice.ts     # Raw Discord REST API for native voice messages
     ├── files.ts             # File I/O helpers
     └── logger.ts            # Timestamped console logger
 ```
@@ -161,8 +180,9 @@ src/
 
 - **TypeScript + Node.js 22** — no framework, full control
 - **discord.js v14** — Discord client
-- **Google Gemini** — `gemini-3.1-flash-lite-preview` for chat, `gemini-3.1-flash-image-preview` for images
+- **Google Gemini** — `gemini-3.1-flash-lite-preview` for chat, `gemini-3.1-flash-image-preview` for images, `gemini-2.5-flash-preview-tts` for speech
 - **Gemini tools** — Google Search grounding + URL context for real-time web access
+- **ffmpeg** — PCM-to-OGG Opus conversion for Discord voice messages
 - **Local markdown + JSON files** — persistence
 - **node-cron** — outreach scheduling
 
