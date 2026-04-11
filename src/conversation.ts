@@ -1,6 +1,8 @@
-import { Message, TextChannel, DMChannel, AttachmentBuilder } from 'discord.js';
+import { Message, TextChannel, DMChannel, AttachmentBuilder, MessageFlags } from 'discord.js';
 import { chat, type ChatMessage } from './utils/llm.js';
 import { generateImage } from './utils/image.js';
+import { transcribeAudio, textToSpeech } from './utils/audio.js';
+import { sendVoiceMessage } from './utils/discord-voice.js';
 import { buildSystemPrompt } from './prompts/system.js';
 import { appendMessage, loadConversationLog } from './brain/memory.js';
 import { loadState, saveState } from './brain/state.js';
@@ -50,7 +52,39 @@ export async function handleMessage(message: Message): Promise<void> {
 async function respond(messages: Message[]): Promise<void> {
   if (messages.length === 0) return;
   const channel = messages[0].channel as TextChannel | DMChannel;
-  const ownerText = messages.map((m) => m.content).join('\n');
+
+  // Detect voice messages and transcribe them
+  let ownerText = '';
+  let replyAsVoice = false;
+
+  for (const msg of messages) {
+    const isVoice = msg.flags.has(MessageFlags.IsVoiceMessage);
+    if (isVoice) {
+      replyAsVoice = true;
+      const audioAttachment = msg.attachments.first();
+      if (audioAttachment) {
+        try {
+          const audioResponse = await fetch(audioAttachment.url);
+          const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+          const transcription = await transcribeAudio(audioBuffer, audioAttachment.contentType || 'audio/ogg');
+          if (transcription) {
+            ownerText += (ownerText ? '\n' : '') + transcription;
+          } else {
+            ownerText += (ownerText ? '\n' : '') + '(sent a voice message that I couldn\'t understand)';
+          }
+        } catch (err) {
+          logger.error('Failed to process voice message', err);
+          ownerText += (ownerText ? '\n' : '') + '(sent a voice message)';
+        }
+      }
+    } else {
+      ownerText += (ownerText ? '\n' : '') + msg.content;
+      // If the user explicitly sends text after voice, switch back to text mode
+      if (msg.content.length > 0) replyAsVoice = false;
+    }
+  }
+
+  if (!ownerText.trim()) return;
 
   try {
     if ('sendTyping' in channel) {
@@ -71,7 +105,13 @@ async function respond(messages: Message[]): Promise<void> {
     }));
     chatMessages.push({ role: 'user', content: ownerText });
 
-    // 3. Generate text response — enable web tools when URLs or search-worthy content is present
+    // 3. Check if owner explicitly asked for text reply while in voice mode
+    const TEXT_MODE_RE = /\b(reply in text|text me|type it|send text|don'?t.*voice|no voice|text reply|write it)\b/i;
+    if (replyAsVoice && TEXT_MODE_RE.test(ownerText)) {
+      replyAsVoice = false;
+    }
+
+    // 4. Generate text response — enable web tools when URLs or search-worthy content is present
     const hasUrl = URL_RE.test(ownerText);
     const tools: Record<string, unknown>[] = [];
     if (hasUrl) tools.push({ urlContext: {} });
@@ -122,8 +162,17 @@ async function respond(messages: Message[]): Promise<void> {
     const delay = Math.min(Math.max((textToSend.length) * 30, 800), 3000);
     await sleep(delay);
 
-    // 6. Send to Discord (text + optional image, skip if reaction-only)
-    if (imageBuffer) {
+    // 6. Send to Discord (voice / text+image / text / reaction-only)
+    if (replyAsVoice && textToSend && !imageBuffer) {
+      if ('sendTyping' in channel) await channel.sendTyping();
+      const oggBuffer = await textToSpeech(textToSend);
+      if (oggBuffer) {
+        const sent = await sendVoiceMessage(channel.client, channel, oggBuffer);
+        if (!sent) await channel.send(textToSend);
+      } else {
+        await channel.send(textToSend);
+      }
+    } else if (imageBuffer) {
       const attachment = new AttachmentBuilder(imageBuffer, { name: 'image.png' });
       if (textToSend) {
         await channel.send({ content: textToSend, files: [attachment] });
@@ -135,13 +184,18 @@ async function respond(messages: Message[]): Promise<void> {
     }
 
     // 7. Persist both sides to the log
-    const botLogContent = imageMatch
+    let botLogContent = imageMatch
       ? `${textToSend} (sent an image: ${imageMatch[1]})`
       : response.content;
+    if (replyAsVoice) botLogContent += ' [replied as voice message]';
+
+    const ownerLogContent = replyAsVoice
+      ? `[voice message] ${ownerText}`
+      : ownerText;
 
     await appendMessage({
       role: 'owner',
-      content: ownerText,
+      content: ownerLogContent,
       timestamp: new Date().toISOString(),
     });
     await appendMessage({
